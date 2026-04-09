@@ -7,19 +7,23 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3099",
 ];
 
-const MODEL = "claude-sonnet-4-6";
+// Model to use. Options:
+//   - A named model: "claude-haiku-4-5" (cost-effective, fast)
+//   - A BYOK provider ID from Settings → AI → Providers (e.g. "byok:abc123...")
+const MODEL = "claude-haiku-4-5";
+
 const MAX_JD = 10000;
 const MIN_JD = 80;
 const LIMIT = 2; // fit assessments per IP per 24h — increase if you trust your audience
 const WINDOW_MS = 24 * 60 * 60 * 1000;
-const ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
+const ZO_API_URL = "https://api.zo.computer/zo/ask";
 
 // ─── CANDIDATE PROFILE ───────────────────────────────────────────────────────
-// This is the condensed version of your background that the fit assessment reads.
-// It should cover: years of experience, key achievements with metrics, skill tiers,
+// Condensed version of your background that the fit assessment reads.
+// Cover: years of experience, key achievements with metrics, skill tiers,
 // target role types, strong fits, poor fits, and compensation range.
 //
-// Keep it focused and specific — this is what generates the match/gap analysis.
+// Keep it focused and specific — this drives the match/gap analysis.
 // The more specific your poor fits are, the more honest the scoring will be.
 
 const CANDIDATE_PROFILE = `[YOUR NAME] is a [YOUR TITLE] with [X]+ years [ONE-LINE DESCRIPTION].
@@ -161,10 +165,12 @@ export default async (c: Context) => {
     });
   }
 
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return c.json({ error: "Missing ANTHROPIC_API_KEY" }, 500);
+  // ZO_CLIENT_IDENTITY_TOKEN is automatically available in all Zo Space routes.
+  // No setup required — it's injected by the platform.
+  const zoToken = process.env.ZO_CLIENT_IDENTITY_TOKEN;
+  if (!zoToken) return c.json({ error: "Missing ZO_CLIENT_IDENTITY_TOKEN" }, 500);
 
-  // Parse and validate body BEFORE consuming rate limit — invalid input doesn't burn the quota
+  // Parse and validate body BEFORE consuming rate limit quota
   let jobDescription: string;
   try {
     const body = await c.req.json();
@@ -201,50 +207,73 @@ export default async (c: Context) => {
   }
 
   try {
-    const anthropicRes = await fetch(ANTHROPIC_URL, {
+    const zoRes = await fetch(ZO_API_URL, {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-        accept: "application/json",
+        authorization: zoToken,
       },
       body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 1200,
-        temperature: 0.2,
+        model_name: MODEL,
+        input: `CANDIDATE PROFILE:\n${CANDIDATE_PROFILE}\n\nJOB DESCRIPTION TO EVALUATE:\n${jd}`,
         system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: `JOB DESCRIPTION TO EVALUATE:\n${jd}` }],
+        output_format: {
+          type: "object",
+          properties: {
+            score: { type: "number" },
+            scoreLabel: { type: "string", enum: ["Strong Match", "Good Match", "Partial Match", "Poor Match"] },
+            scoreColor: { type: "string", enum: ["green", "yellow", "orange", "red"] },
+            matches: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { point: { type: "string" }, detail: { type: "string" } },
+                required: ["point", "detail"],
+              },
+            },
+            gaps: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: { point: { type: "string" }, detail: { type: "string" } },
+                required: ["point", "detail"],
+              },
+            },
+            recommendation: { type: "string" },
+            goodToKnow: { type: "string" },
+          },
+          required: ["score", "scoreLabel", "scoreColor", "matches", "gaps", "recommendation", "goodToKnow"],
+        },
       }),
     });
 
-    if (!anthropicRes.ok) {
-      const text = await anthropicRes.text().catch(() => "");
-      console.error("Anthropic assess-fit error:", text || anthropicRes.statusText);
-      const status = anthropicRes.status === 429 ? 429 : anthropicRes.status >= 500 ? 503 : 502;
+    if (!zoRes.ok) {
+      const text = await zoRes.text().catch(() => "");
+      console.error("Zo API assess-fit error:", text || zoRes.statusText);
+      const status = zoRes.status === 429 ? 429 : zoRes.status >= 500 ? 503 : 502;
       return c.json(
-        { error: anthropicRes.status === 429 ? "rate_limited" : "upstream_unavailable" },
+        { error: zoRes.status === 429 ? "rate_limited" : "upstream_unavailable", status: zoRes.status },
         status,
         { ...cors(c) }
       );
     }
 
-    const data = await anthropicRes.json();
-    const text = Array.isArray(data?.content)
-      ? data.content.filter((item: any) => item?.type === "text").map((item: any) => item.text || "").join("")
-      : "";
+    const zoData = await zoRes.json();
 
-    const cleanedText = text.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/, "");
+    // When output_format is used, zoData.output is already a parsed object
+    let result: any = typeof zoData.output === "object" && zoData.output !== null
+      ? zoData.output
+      : (() => {
+          const raw = typeof zoData.output === "string" ? zoData.output : "";
+          const cleaned = raw.trim().replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/\s*```$/, "");
+          try { return JSON.parse(cleaned); } catch { return null; }
+        })();
 
-    let result: any;
-    try {
-      result = JSON.parse(cleanedText);
-    } catch {
-      console.error("Invalid JSON from Anthropic:", text?.slice?.(0, 500));
+    if (!result) {
+      console.error("Invalid JSON from Zo API assess-fit output:", zoData.output);
       return c.json({ error: "Assessment service returned an invalid response" }, 502, { ...cors(c) });
     }
 
-    // Normalize score in case model returns e.g. 85 instead of 8.5
     const normalizedScore = Math.max(1, Math.min(10, Math.round(result.score / 10)));
     result = {
       ...result,
